@@ -13,6 +13,8 @@ def subscribe(cloud_event):
     # 1. Decode Pub/Sub notification payload from GCS event
     pubsub_message = base64.b64decode(cloud_event.data["message"]["data"]).decode('utf-8')
     file_metadata = json.loads(pubsub_message)
+
+    print(f"Received file metadata: {file_metadata}")
     
     bucket_name = file_metadata['bucket']
     file_name = file_metadata['name']
