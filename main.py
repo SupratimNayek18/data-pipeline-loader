@@ -7,7 +7,7 @@ from google.cloud import bigquery, storage
 
 app = Flask(__name__)
 
-# Lazy initialization
+# Lazy client initialization to avoid container boot delays
 _bq_client = None
 _storage_client = None
 
@@ -44,13 +44,13 @@ def validate_order(data):
 
     return True, "VALID"
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/", methods=["GET"])
+def health_check():
+    return jsonify({"status": "healthy"}), 200
+
+@app.route("/", methods=["POST"])
 @app.route("/process", methods=["POST"])
 def process_event():
-    # Handle Cloud Run health checks (GET)
-    if request.method == "GET":
-        return jsonify({"status": "healthy"}), 200
-
     envelope = request.get_json(silent=True)
     if not envelope:
         return jsonify({"error": "Missing payload"}), 400
