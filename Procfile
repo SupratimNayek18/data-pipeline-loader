@@ -1,0 +1,1 @@
+web: functions-framework --target=process_event --port=$PORT
