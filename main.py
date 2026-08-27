@@ -1,9 +1,13 @@
+import os
 import base64
 import json
 from datetime import datetime
+from flask import Flask, request, jsonify
 from google.cloud import bigquery, storage
 
-# Lazy initialization placeholders (prevents startup crashes)
+app = Flask(__name__)
+
+# Lazy initialization placeholders
 _bq_client = None
 _storage_client = None
 
@@ -40,30 +44,25 @@ def validate_order(data):
 
     return True, "VALID"
 
-def process_event(request):
-    """
-    Cloud Functions / Cloud Run entrypoint.
-    """
-    try:
-        request_json = request.get_json(silent=True) if hasattr(request, "get_json") else request
-    except Exception:
-        request_json = request
+@app.route("/", methods=["POST"])
+@app.route("/process", methods=["POST"])
+def process_event():
+    envelope = request.get_json(silent=True)
+    if not envelope:
+        return jsonify({"error": "Missing payload"}), 400
 
-    if not request_json:
-        return ("Bad Request: Empty payload", 400)
-
-    # Parse Pub/Sub envelope wrapper safely
-    event_payload = request_json
-    if isinstance(request_json, dict):
-        if "message" in request_json and "data" in request_json["message"]:
+    # Handle Pub/Sub wrapper
+    event_payload = envelope
+    if isinstance(envelope, dict):
+        if "message" in envelope and "data" in envelope["message"]:
             try:
-                decoded = base64.b64decode(request_json["message"]["data"]).decode("utf-8")
+                decoded = base64.b64decode(envelope["message"]["data"]).decode("utf-8")
                 event_payload = json.loads(decoded)
             except Exception:
                 pass
-        elif "data" in request_json:
+        elif "data" in envelope:
             try:
-                decoded = base64.b64decode(request_json["data"]).decode("utf-8")
+                decoded = base64.b64decode(envelope["data"]).decode("utf-8")
                 event_payload = json.loads(decoded)
             except Exception:
                 pass
@@ -72,7 +71,7 @@ def process_event(request):
     file_name = event_payload.get("name")
 
     if not bucket_name or not file_name:
-        return ("Skipped: Not a valid GCS event notification", 200)
+        return jsonify({"status": "skipped", "message": "Not a valid GCS event notification"}), 200
 
     bq = get_bq_client()
     st = get_storage_client()
@@ -96,7 +95,7 @@ def process_event(request):
             "error_timestamp": datetime.utcnow().isoformat()
         }]
         bq.insert_rows_json(dlq_table, dlq_row)
-        return ("File read error routed to DLQ", 200)
+        return jsonify({"status": "error_routed_to_dlq", "message": str(e)}), 200
 
     clean_batch = []
     dlq_batch = []
@@ -140,4 +139,76 @@ def process_event(request):
     if dlq_batch:
         bq.insert_rows_json(dlq_table, dlq_batch)
 
-    return (f"Successfully processed {len(records)} records from {file_name}", 200)
+    return jsonify({"status": "success", "processed_records": len(records)}), 200
+
+
+@app.route("/retry", methods=["POST"])
+def retry_dlq():
+    """
+    DLQ Reprocessing Endpoint: Reads UNRESOLVED records, re-evaluates 
+    them against validation rules, and moves valid records to Silver Clean.
+    """
+    bq = get_bq_client()
+    project_id = bq.project
+    clean_table = f"{project_id}.silver_staging.clean_orders"
+    dlq_table = f"{project_id}.silver_staging.dlq_orders"
+
+    query = f"""
+        SELECT dlq_id, raw_payload 
+        FROM `{dlq_table}`
+        WHERE status IN ('PATCHED', 'UNRESOLVED')
+        LIMIT 100
+    """
+    
+    try:
+        rows = list(bq.query(query).result())
+    except Exception as e:
+        return jsonify({"error": f"Failed to query DLQ table: {str(e)}"}), 500
+
+    reprocessed_count = 0
+    for row in rows:
+        try:
+            raw_payload = row["raw_payload"]
+            payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+            is_valid, _ = validate_order(payload)
+
+            if is_valid:
+                quality_flag = "HIGH_VALUE" if float(payload.get("total_amount", 0)) >= 500 else "STANDARD"
+                clean_row = [{
+                    "order_id": str(payload.get("order_id")),
+                    "order_group_id": payload.get("order_group_id"),
+                    "customer_id": str(payload.get("customer_id")),
+                    "store_region": payload.get("store_region", "UNKNOWN"),
+                    "currency": payload.get("currency", "USD"),
+                    "subtotal_amount": payload.get("subtotal_amount"),
+                    "tax_amount": payload.get("tax_amount", 0),
+                    "discount_amount": payload.get("discount_amount", 0),
+                    "shipping_fee": payload.get("shipping_fee", 0),
+                    "total_amount": payload.get("total_amount"),
+                    "payment_method": payload.get("payment_method"),
+                    "payment_status": payload.get("payment_status", "COMPLETED"),
+                    "fulfillment_status": payload.get("fulfillment_status", "PENDING"),
+                    "item_count": payload.get("item_count", 1),
+                    "device_type": payload.get("device_type", "UNKNOWN"),
+                    "ip_country": payload.get("ip_country", "UNKNOWN"),
+                    "quality_flag": quality_flag,
+                    "processed_at": datetime.utcnow().isoformat()
+                }]
+                
+                bq.insert_rows_json(clean_table, clean_row)
+                
+                update_sql = f"""
+                    UPDATE `{dlq_table}`
+                    SET status = 'RETRIED'
+                    WHERE dlq_id = '{row["dlq_id"]}'
+                """
+                bq.query(update_sql).result()
+                reprocessed_count += 1
+        except Exception:
+            continue
+
+    return jsonify({"status": "retry_complete", "reprocessed_records": reprocessed_count}), 200
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))

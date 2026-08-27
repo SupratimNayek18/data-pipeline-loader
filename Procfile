@@ -1,1 +1,1 @@
-web: functions-framework --target=process_event --port=$PORT
+web: gunicorn --bind :$PORT main:app
