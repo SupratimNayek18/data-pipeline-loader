@@ -7,7 +7,7 @@ from google.cloud import bigquery, storage
 
 app = Flask(__name__)
 
-# Lazy initialization placeholders
+# Lazy initialization
 _bq_client = None
 _storage_client = None
 
@@ -44,14 +44,17 @@ def validate_order(data):
 
     return True, "VALID"
 
-@app.route("/", methods=["POST"])
+@app.route("/", methods=["GET", "POST"])
 @app.route("/process", methods=["POST"])
 def process_event():
+    # Handle Cloud Run health checks (GET)
+    if request.method == "GET":
+        return jsonify({"status": "healthy"}), 200
+
     envelope = request.get_json(silent=True)
     if not envelope:
         return jsonify({"error": "Missing payload"}), 400
 
-    # Handle Pub/Sub wrapper
     event_payload = envelope
     if isinstance(envelope, dict):
         if "message" in envelope and "data" in envelope["message"]:
@@ -141,13 +144,8 @@ def process_event():
 
     return jsonify({"status": "success", "processed_records": len(records)}), 200
 
-
 @app.route("/retry", methods=["POST"])
 def retry_dlq():
-    """
-    DLQ Reprocessing Endpoint: Reads UNRESOLVED records, re-evaluates 
-    them against validation rules, and moves valid records to Silver Clean.
-    """
     bq = get_bq_client()
     project_id = bq.project
     clean_table = f"{project_id}.silver_staging.clean_orders"
@@ -208,7 +206,6 @@ def retry_dlq():
             continue
 
     return jsonify({"status": "retry_complete", "reprocessed_records": reprocessed_count}), 200
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
