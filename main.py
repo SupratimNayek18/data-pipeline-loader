@@ -1,99 +1,154 @@
-import base64
+import os
 import json
-from datetime import datetime, timezone
-import functions_framework
+import base64
+from datetime import datetime
+from flask import Flask, request, jsonify
 from google.cloud import bigquery
-from google.cloud import storage
 
+app = Flask(__name__)
 bq_client = bigquery.Client()
-storage_client = storage.Client()
 
-@functions_framework.cloud_event
-def subscribe(cloud_event):
-    # 1. Decode Pub/Sub notification payload from GCS event
-    pubsub_message = base64.b64decode(cloud_event.data["message"]["data"]).decode('utf-8')
-    file_metadata = json.loads(pubsub_message)
+PROJECT_ID = os.getenv("GCP_PROJECT", bq_client.project)
+SILVER_CLEAN_TABLE = f"{PROJECT_ID}.silver_staging.clean_orders"
+SILVER_DLQ_TABLE = f"{PROJECT_ID}.silver_staging.dlq_orders"
 
-    print(f"Received file metadata: {file_metadata}")
-    
-    bucket_name = file_metadata['bucket']
-    file_name = file_metadata['name']
-    
-    # Process JSON files only
-    if not file_name.endswith('.json'):
-        print(f"Skipping non-JSON file: {file_name}")
-        return
 
-    # 2. Download file contents directly from GCS bucket
-    bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(file_name)
-    file_content = blob.download_as_text()
+def validate_order(data):
+    required_fields = ["order_id", "customer_id", "subtotal_amount", "total_amount"]
+    for field in required_fields:
+        if field not in data or data[field] is None:
+            return False, f"Missing required field: {field}"
 
-    clean_records = []
-    dlq_records = []
-    now = datetime.now(timezone.utc).isoformat()
+    subtotal = float(data.get("subtotal_amount", 0))
+    tax = float(data.get("tax_amount", 0))
+    shipping = float(data.get("shipping_fee", 0))
+    discount = float(data.get("discount_amount", 0))
+    total = float(data.get("total_amount", 0))
 
-    # 3. Rules Engine: Iterate and validate each row
-    for line in file_content.strip().split('\n'):
-        if not line.strip():
-            continue
+    expected_total = round(subtotal + tax + shipping - discount, 2)
+    if round(total, 2) != expected_total:
+        return False, f"Financial mismatch: expected total {expected_total}, got {total}"
+
+    return True, "VALID"
+
+
+@app.route("/process", methods=["POST"])
+def process_event():
+    envelope = request.get_json()
+    if not envelope or "message" not in envelope:
+        return jsonify({"error": "Invalid Pub/Sub payload"}), 400
+
+    pubsub_message = envelope["message"]
+    if "data" in pubsub_message:
+        raw_decoded = base64.b64decode(pubsub_message["data"]).decode("utf-8")
         try:
-            record = json.loads(line)
-            order_id = record.get('order_id')
-            customer_id = record.get('customer_id')
-            amount = record.get('amount')
-            status = record.get('status', 'UNKNOWN')
-
-            # Rule 1: Mandate valid IDs
-            if not order_id or not customer_id:
-                dlq_records.append({
-                    "raw_record": line,
-                    "rejection_reason": "MISSING_MANDATORY_KEYS",
-                    "failed_at": now
-                })
-                continue
-
-            # Rule 2: Mandate positive numeric amounts
-            try:
-                numeric_amount = float(amount)
-                if numeric_amount <= 0:
-                    raise ValueError("Amount <= 0")
-            except (ValueError, TypeError):
-                dlq_records.append({
-                    "raw_record": line,
-                    "rejection_reason": "INVALID_OR_NON_POSITIVE_AMOUNT",
-                    "failed_at": now
-                })
-                continue
-
-            # Rule 3 & 4: Transformation & Dynamic Quality Tagging
-            quality_flag = "HIGH_VALUE" if numeric_amount > 5000 else "STANDARD"
-            clean_records.append({
-                "order_id": str(order_id),
-                "customer_id": str(customer_id),
-                "amount": numeric_amount,
-                "status": str(status).upper(),
-                "quality_flag": quality_flag,
-                "processed_at": now
-            })
-
+            payload = json.loads(raw_decoded)
         except Exception as e:
-            dlq_records.append({
-                "raw_record": line,
-                "rejection_reason": f"JSON_PARSE_ERROR: {str(e)}",
-                "failed_at": now
-            })
+            dlq_row = [{
+                "dlq_id": f"dlq_{datetime.utcnow().timestamp()}",
+                "raw_payload": raw_decoded,
+                "source_file": "pubsub_stream",
+                "rejection_reason": f"Corrupted JSON: {str(e)}",
+                "status": "UNRESOLVED",
+                "error_timestamp": datetime.utcnow().isoformat()
+            }]
+            bq_client.insert_rows_json(SILVER_DLQ_TABLE, dlq_row)
+            return jsonify({"status": "routed_to_dlq"}), 200
+    else:
+        return jsonify({"error": "Empty payload"}), 400
 
-    # 4. Route valid records to clean_orders table
-    if clean_records:
-        errors = bq_client.insert_rows_json("phase3_mastery.clean_orders", clean_records)
-        if errors:
-            print(f"Errors inserting clean records: {errors}")
+    is_valid, reason = validate_order(payload)
 
-    # 5. Route rejected records to DLQ table
-    if dlq_records:
-        errors = bq_client.insert_rows_json("phase3_mastery.dlq_orders", dlq_records)
-        if errors:
-            print(f"Errors inserting DLQ records: {errors}")
+    if is_valid:
+        quality_flag = "HIGH_VALUE" if float(payload.get("total_amount", 0)) >= 500 else "STANDARD"
+        clean_row = [{
+            "order_id": payload.get("order_id"),
+            "order_group_id": payload.get("order_group_id"),
+            "customer_id": payload.get("customer_id"),
+            "store_region": payload.get("store_region", "UNKNOWN"),
+            "currency": payload.get("currency", "USD"),
+            "subtotal_amount": payload.get("subtotal_amount"),
+            "tax_amount": payload.get("tax_amount", 0),
+            "discount_amount": payload.get("discount_amount", 0),
+            "shipping_fee": payload.get("shipping_fee", 0),
+            "total_amount": payload.get("total_amount"),
+            "payment_method": payload.get("payment_method"),
+            "payment_status": payload.get("payment_status", "COMPLETED"),
+            "fulfillment_status": payload.get("fulfillment_status", "PENDING"),
+            "item_count": payload.get("item_count", 1),
+            "device_type": payload.get("device_type", "UNKNOWN"),
+            "ip_country": payload.get("ip_country", "UNKNOWN"),
+            "quality_flag": quality_flag,
+            "processed_at": datetime.utcnow().isoformat()
+        }]
+        bq_client.insert_rows_json(SILVER_CLEAN_TABLE, clean_row)
+        return jsonify({"status": "success", "destination": "clean_orders"}), 200
+    else:
+        dlq_row = [{
+            "dlq_id": f"dlq_{payload.get('order_id', datetime.utcnow().timestamp())}",
+            "raw_payload": json.dumps(payload),
+            "source_file": "pubsub_stream",
+            "rejection_reason": reason,
+            "status": "UNRESOLVED",
+            "error_timestamp": datetime.utcnow().isoformat()
+        }]
+        bq_client.insert_rows_json(SILVER_DLQ_TABLE, dlq_row)
+        return jsonify({"status": "success", "destination": "dlq_orders"}), 200
 
-    print(f"Finished processing {file_name}: {len(clean_records)} clean, {len(dlq_records)} routed to DLQ.")
+
+@app.route("/retry", methods=["POST"])
+def retry_dlq():
+    query = f"""
+        SELECT dlq_id, raw_payload 
+        FROM `{SILVER_DLQ_TABLE}`
+        WHERE status IN ('PATCHED', 'UNRESOLVED')
+        LIMIT 100
+    """
+    rows = list(bq_client.query(query).result())
+
+    reprocessed_count = 0
+    for row in rows:
+        try:
+            payload = json.loads(row["raw_payload"]) if isinstance(row["raw_payload"], str) else row["raw_payload"]
+            is_valid, _ = validate_order(payload)
+
+            if is_valid:
+                quality_flag = "HIGH_VALUE" if float(payload.get("total_amount", 0)) >= 500 else "STANDARD"
+                clean_row = [{
+                    "order_id": payload.get("order_id"),
+                    "order_group_id": payload.get("order_group_id"),
+                    "customer_id": payload.get("customer_id"),
+                    "store_region": payload.get("store_region", "UNKNOWN"),
+                    "currency": payload.get("currency", "USD"),
+                    "subtotal_amount": payload.get("subtotal_amount"),
+                    "tax_amount": payload.get("tax_amount", 0),
+                    "discount_amount": payload.get("discount_amount", 0),
+                    "shipping_fee": payload.get("shipping_fee", 0),
+                    "total_amount": payload.get("total_amount"),
+                    "payment_method": payload.get("payment_method"),
+                    "payment_status": payload.get("payment_status", "COMPLETED"),
+                    "fulfillment_status": payload.get("fulfillment_status", "PENDING"),
+                    "item_count": payload.get("item_count", 1),
+                    "device_type": payload.get("device_type", "UNKNOWN"),
+                    "ip_country": payload.get("ip_country", "UNKNOWN"),
+                    "quality_flag": quality_flag,
+                    "processed_at": datetime.utcnow().isoformat()
+                }]
+                
+                bq_client.insert_rows_json(SILVER_CLEAN_TABLE, clean_row)
+                
+                update_sql = f"""
+                    UPDATE `{SILVER_DLQ_TABLE}`
+                    SET status = 'RETRIED'
+                    WHERE dlq_id = '{row["dlq_id"]}'
+                """
+                bq_client.query(update_sql).result()
+                reprocessed_count += 1
+        except Exception:
+            continue
+
+    return jsonify({"status": "retry_complete", "reprocessed_records": reprocessed_count}), 200
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
