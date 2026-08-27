@@ -35,29 +35,38 @@ def validate_order(data):
     return True, "VALID"
 
 
-def process_event(event, context=None):
+def process_event(request):
     """
-    Entrypoint function triggered by Cloud Build/Functions Framework.
-    Extracts GCS pointer from Pub/Sub, validates rows, and writes to BigQuery.
+    HTTP entrypoint function called by functions-framework / Cloud Run.
+    Extracts GCS pointer from Pub/Sub payload, validates rows, and writes to BigQuery.
     """
-    # Parse Pub/Sub envelope wrapper or direct payload
-    if isinstance(event, dict) and "data" in event:
-        raw_message = base64.b64decode(event["data"]).decode("utf-8")
-        event_payload = json.loads(raw_message)
-    elif isinstance(event, dict) and "message" in event:
-        raw_message = base64.b64decode(event["message"]["data"]).decode("utf-8")
+    # 1. Parse incoming request body
+    request_json = request.get_json(silent=True) if hasattr(request, "get_json") else request
+    if not request_json:
+        return ("Bad Request: Missing JSON payload", 400)
+
+    # 2. Extract Pub/Sub envelope wrapper
+    if isinstance(request_json, dict) and "message" in request_json:
+        pubsub_message = request_json["message"]
+        if "data" in pubsub_message:
+            raw_message = base64.b64decode(pubsub_message["data"]).decode("utf-8")
+            event_payload = json.loads(raw_message)
+        else:
+            return ("Bad Request: Empty Pub/Sub data payload", 400)
+    elif isinstance(request_json, dict) and "data" in request_json:
+        raw_message = base64.b64decode(request_json["data"]).decode("utf-8")
         event_payload = json.loads(raw_message)
     else:
-        event_payload = event
+        event_payload = request_json
 
-    # Extract bucket and file path pointer
+    # 3. Extract GCS Bucket and Object reference
     bucket_name = event_payload.get("bucket")
     file_name = event_payload.get("name")
 
     if not bucket_name or not file_name:
-        return "Skipped: Not a valid GCS event notification", 200
+        return ("Skipped: Not a valid GCS event notification", 200)
 
-    # Stream file contents from GCS
+    # 4. Stream file contents from GCS
     try:
         bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(file_name)
@@ -78,12 +87,12 @@ def process_event(event, context=None):
             "error_timestamp": datetime.utcnow().isoformat()
         }]
         bq_client.insert_rows_json(SILVER_DLQ_TABLE, dlq_row)
-        return "Corrupted file routed to DLQ", 200
+        return ("Corrupted file routed to DLQ", 200)
 
     clean_batch = []
     dlq_batch = []
 
-    # Process and classify rows
+    # 5. Process and classify rows
     for payload in records:
         is_valid, reason = validate_order(payload)
 
@@ -119,10 +128,10 @@ def process_event(event, context=None):
                 "error_timestamp": datetime.utcnow().isoformat()
             })
 
-    # Bulk insert into Silver tables
+    # 6. Bulk insert into Silver tables
     if clean_batch:
         bq_client.insert_rows_json(SILVER_CLEAN_TABLE, clean_batch)
     if dlq_batch:
         bq_client.insert_rows_json(SILVER_DLQ_TABLE, dlq_batch)
 
-    return f"Successfully processed {len(records)} records from {file_name}", 200
+    return (f"Successfully processed {len(records)} records from {file_name}", 200)
